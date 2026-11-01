@@ -12,3 +12,4 @@ class GraphState(TypedDict):
     max_retries: int
     answer: Optional[str] # final answer
     sources: List[dict] # sources for the answer
+    search_source: Optional[str] # "vector_store" | "web_search" | None

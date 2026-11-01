@@ -5,6 +5,7 @@ import requests
 from config import (
     BACKEND_URL,
     CHAT_TIMEOUT_SECONDS,
+    FEEDBACK_TIMEOUT_SECONDS,
     HEALTH_TIMEOUT_SECONDS,
     INGEST_TIMEOUT_SECONDS,
 )
@@ -76,6 +77,25 @@ def send_chat_message(question: str) -> dict[str, Any]:
         "/chat",
         CHAT_TIMEOUT_SECONDS,
         json={"question": question},
+    )
+
+
+def send_feedback(
+    rating: str,
+    comment: str | None = None,
+    question: str | None = None,
+    answer: str | None = None,
+) -> dict[str, Any]:
+    return _request_json(
+        "POST",
+        "/feedback",
+        FEEDBACK_TIMEOUT_SECONDS,
+        json={
+            "rating": rating,
+            "comment": comment,
+            "question": question,
+            "answer": answer,
+        },
     )
 
 

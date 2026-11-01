@@ -22,7 +22,8 @@ def chat(request: ChatRequest):
         "retry_count": 0,
         "max_retries": 2,
         "answer": None,
-        "sources": []
+        "sources": [],
+        "search_source": None,
     }
 
     result = rag_graph.invoke(initial_state)
@@ -31,5 +32,6 @@ def chat(request: ChatRequest):
         answer=result["answer"],
         sources=result["sources"],
         query_type=result["query_type"],
-        retries_used=result["retry_count"]
+        retries_used=result["retry_count"],
+        search_source=result.get("search_source"),
     )

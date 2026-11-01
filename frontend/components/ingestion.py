@@ -33,9 +33,10 @@ def render_ingestion() -> None:
 
     with st.form("document_ingestion"):
         uploaded_file = st.file_uploader(
-            "Upload a Markdown document",
-            type=["md"],
+            "Upload a document (.md, .txt, .html)",
+            type=["md", "txt", "html", "htm"],
             accept_multiple_files=False,
+            help="Supported formats: Markdown (.md), Plain Text (.txt), HTML (.html, .htm)",
         )
         ingest_document = st.form_submit_button(
             "Ingest Document",
@@ -44,7 +45,7 @@ def render_ingestion() -> None:
 
     if ingest_document:
         if uploaded_file is None:
-            st.warning("Choose a Markdown (.md) file before ingesting.")
+            st.warning("Choose a file (.md, .txt, or .html) before ingesting.")
         else:
             try:
                 with st.spinner("Ingesting document..."):

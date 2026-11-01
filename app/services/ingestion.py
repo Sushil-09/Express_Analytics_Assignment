@@ -23,16 +23,28 @@ def get_embeddings():
 def get_vector_store():
     return Chroma(persist_directory=CHROMA_DB_PATH, embedding_function=get_embeddings(), collection_name="technical_docs",)
 
-def load_markdown_file(file_path: str) -> List[Document]:
+def load_file(file_path: str) -> List[Document]:
     path = Path(file_path)
 
     if not path.exists():
         raise FileNotFoundError(f"file not found: {file_path}")
 
     content = path.read_text(encoding="utf-8")
+    ext = path.suffix.lower()
+
+    if ext in {".html", ".htm"}:
+        soup = BeautifulSoup(content, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header"]):
+            tag.decompose()
+        text = soup.get_text(separator="\n", strip=True)
+    else:
+        text = content
+
+    if not text.strip():
+        raise ValueError(f"File '{path.name}' contains no readable text content.")
 
     document = Document(
-        page_content=content,
+        page_content=text,
         metadata={
             "source": str(path),
             "file_name": path.name,
@@ -41,6 +53,9 @@ def load_markdown_file(file_path: str) -> List[Document]:
     )
 
     return [document]
+
+# Alias for backwards compatibility
+load_markdown_file = load_file
 
 def load_url(url: str) -> List[Document]:
     response = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
@@ -78,9 +93,21 @@ def ingest_documents(documents: List[Document]):
     }
 
 def load_uploaded_file(content: str, filename: str) -> List[Document]:
-    
+    ext = Path(filename).suffix.lower()
+
+    if ext in {".html", ".htm"}:
+        soup = BeautifulSoup(content, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header"]):
+            tag.decompose()
+        text = soup.get_text(separator="\n", strip=True)
+    else:
+        text = content
+
+    if not text.strip():
+        raise ValueError(f"File '{filename}' contains no readable text content.")
+
     document = Document(
-        page_content=content,
+        page_content=text,
         metadata={
             "source": filename,
             "file_name": filename,
