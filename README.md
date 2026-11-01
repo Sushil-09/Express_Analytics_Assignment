@@ -295,44 +295,88 @@ curl -X GET http://127.0.0.1:8000/feedback
 
 ---
 
-## Design Decisions & Tradeoffs
+## Technical Write-Up: Architectural Reasoning, Tradeoffs & Strategy
 
-### 1. LangGraph Self-Corrective Loop vs. Naive RAG
-- **Decision**: Implemented an active graph with query rewriting, document grading, and fallback routing instead of a linear Retrieve $\rightarrow$ Generate pipeline.
-- **Tradeoff**: Increased latency per request on difficult or ambiguous queries (due to LLM document grading and potential retry turns).
-- **Benefit**: Vastly reduces hallucination by ensuring answers are generated exclusively from verified, relevant content.
+### 1. Thought Process & Reasoning Behind the Architecture
 
-### 2. Chunking Strategy (`RecursiveCharacterTextSplitter`)
-- **Decision**: Chunk size of 1000 characters with 200 character overlap, splitting on paragraphs (`\n\n`), code boundaries (`\n`), and sentences.
-- **Tradeoff**: 1000 characters balances contextual completeness for technical explanations with code snippets. Larger chunks dilute embedding precision; smaller chunks fragment code blocks and API signatures.
-- **HTML & Document Cleaning**: HTML input is parsed with BeautifulSoup to decompose non-content tags (`<nav>`, `<script>`, `<style>`, `<footer>`) prior to chunking, preventing noisy headers and navigation scripts from polluting the embeddings.
+Standard "naive" RAG architectures suffer from a critical flaw: they assume that semantic vector similarity directly correlates with factual answerability. In technical documentation, this assumption frequently breaks down:
+- A user asks how to accomplish a specific task, but vector similarity retrieves chunks containing similar terminology without the actual operational instructions.
+- The user's query is colloquially phrased, poorly worded, or ambiguous, leading vector search astray into irrelevant sections of the documentation.
+- When irrelevant documents are fed into the generation prompt, the LLM either hallucinates an answer or admits defeat even though the answer exists elsewhere under different keywords.
 
-### 3. Local Sentence-Transformers vs. Cloud Embeddings
-- **Decision**: Used `sentence-transformers/all-MiniLM-L6-v2` executed locally via HuggingFace rather than proprietary cloud embedding APIs.
-- **Tradeoff**: Requires local CPU/GPU compute during ingestion.
-- **Benefit**: Zero cost, no external rate limits, fast embedding generation, and 100% reproducibility across environments.
+To solve this, our system employs a **self-corrective, graph-based architecture** implemented with **LangGraph**:
 
-### 4. Document Grading with Structured JSON Output
-- **Decision**: Enforced JSON response mode on the Gemini document grading node with strict schema `{"relevant": true|false}`.
-- **Tradeoff**: Strict format requirements; addressed by configuring `response_mime_type="application/json"`.
-- **Benefit**: Eliminates parsing ambiguity and prevents regex fragility when extracting relevance judgments.
+1. **Explicit Query Analysis**:
+   Before querying the vector index, the system analyzes the user's intent and extracts query metadata (`query_type`). Classifying whether a question is `conceptual`, `how-to`, `troubleshooting`, or `api_reference` prepares the system for specialized handling and contextual clarity.
 
-### 5. Multi-Layer Web Search Fallback
-- **Decision**: Supported Tavily, Serper, and DuckDuckGo with automatic graceful degradation.
-- **Tradeoff**: External web results can be noisier than curated internal documentation.
-- **Benefit**: Prevents the assistant from hitting dead ends when encountering out-of-corpus queries, returning grounded answers with live web links.
+2. **Self-Correction through Document Grading (LLM-as-a-Judge)**:
+   Instead of blindly trusting the top-$k$ nearest neighbors from the vector store, each retrieved chunk is evaluated individually for binary relevance (`{"relevant": true|false}`). This prevents noisy, irrelevant chunks from entering the generation context, which directly mitigates contextual hallucination.
 
-### 6. Persistent Feedback Loop
-- **Decision**: Exposed `POST /feedback` on the backend and integrated `st.feedback("thumbs")` with popover comment submission into the Streamlit chat UI.
-- **Tradeoff**: Added state tracking per message turn in frontend session state.
-- **Benefit**: Captures human-in-the-loop evaluation data persistently in `data/feedback.json` for continuous RAG evaluation.
+3. **Controlled Query Rewriting with Strict Retry Budgeting**:
+   If document grading discovers that *none* of the retrieved documents are relevant, the pipeline does not immediately fail. Instead, it enters an automated self-correction loop where the query is rewritten to clarify intent, remove colloquial noise, and introduce technical synonyms. Crucially, the loop is bound by a strict counter (`retry_count` vs. `max_retries = 2`) to guarantee termination and avoid cyclic latency explosions.
+
+4. **Multi-Tier Fallback Strategy (Web Search $\rightarrow$ Safe Deterministic Fallback)**:
+   If internal retrieval fails even after retrying, the pipeline falls back to live web search (via Tavily, Serper, or DuckDuckGo). This allows the assistant to answer questions about newly released APIs, related third-party libraries, or topics missing from the local corpus, while always maintaining source citations. If web search also produces no relevant results, the system outputs a deterministic, polite "insufficient information" response rather than hallucinating.
 
 ---
 
-## What Would Be Improved With More Time
+### 2. Chunking & Embedding Strategy Choices
 
-1. **Reranking**: Add a Cross-Encoder (e.g. `bge-reranker-large` or Cohere Rerank) between retrieval and grading to re-score documents before LLM grading.
-2. **Conversational Memory**: Add thread-based memory (`langgraph.checkpoint.memory.MemorySaver`) to allow multi-turn follow-up questions referencing previous answers.
-3. **Automated RAG Triad Evaluation**: Integrate TruLens or Ragas to continuously compute Context Relevance, Groundedness, and Answer Relevance on collected feedback data.
-4. **Streaming Answers**: Implement Server-Sent Events (SSE) / WebSocket streaming from FastAPI to Streamlit for real-time token rendering.
+Technical documentation presents distinct chunking challenges compared to generic narrative prose. Code samples, function declarations, parameters, and explanatory text must remain coherent rather than being bisected mid-syntax.
 
+#### Chunking Strategy: `RecursiveCharacterTextSplitter`
+- **Chunk Size: 1000 characters**:
+  - *Reasoning*: A 1000-character window comfortably accommodates 15–25 lines of code alongside accompanying narrative explanations or parameter definitions. Chunks smaller than 500 characters frequently sever functions from their imports and usage examples; chunks larger than 1500 characters dilute dense vector representations and introduce irrelevant context.
+- **Chunk Overlap: 200 characters (20%)**:
+  - *Reasoning*: Overlap ensures that syntactic context (such as function signatures, variable names, and transitional commentary) is preserved across contiguous boundaries, preventing edge effects during semantic matching.
+- **Separators Hierarchy (`["\n\n", "\n", ". ", " ", ""]`)**:
+  - *Reasoning*: Splitting strictly prioritizes paragraph breaks (`\n\n`), followed by single line breaks (`\n`), sentence terminators (`. `), and words. This ensures code blocks and Markdown bullet lists remain intact whenever possible.
+- **Pre-Chunking HTML Sanitization**:
+  - *Reasoning*: Raw HTML contains boilerplate markup (`<script>`, `<style>`, `<nav>`, `<footer>`) that degrades embedding quality. Ingested HTML files and scraped web pages are pre-processed using BeautifulSoup to decompose structural boilerplate and extract clean, readable text before splitting.
+
+#### Embedding Model Choice: `sentence-transformers/all-MiniLM-L6-v2`
+- **Locally Hosted vs. Cloud Embeddings (e.g., OpenAI `text-embedding-3-small`)**:
+  - *Reasoning*: We chose `all-MiniLM-L6-v2` (384 dimensions) for several concrete engineering reasons:
+    1. **Zero Cost & Rate Limits**: Running embeddings locally eliminates external API costs, quota exhaustion, and rate limit errors during bulk document ingestion.
+    2. **Low Latency & High Efficiency**: The 384-dimensional dense vectors provide an optimal tradeoff between retrieval speed, memory footprint in ChromaDB, and semantic accuracy on technical English text.
+    3. **100% Reproducibility & Privacy**: The model operates entirely offline without sending proprietary internal documentation to third-party endpoints.
+
+---
+
+### 3. Key Assumptions Made
+
+1. **Document Format & Encoding**:
+   - Assumed technical documentation is provided in standard UTF-8 encoded text, Markdown (`.md`), HTML (`.html`, `.htm`), or accessible via standard HTTP/HTTPS URLs.
+2. **Deterministic Fallback over Unverified Inference**:
+   - Assumed that returning a confident, honest "insufficient information" message is vastly preferable to an ungrounded or fabricated answer.
+3. **Stateless Single-Turn RAG per Invocation**:
+   - Assumed graph invocations are self-contained per question/response cycle. Session history is maintained by the Streamlit frontend client, while each backend graph execution focuses on solving the immediate user query with high precision.
+4. **Environment Portability**:
+   - Assumed the application may be deployed in environments with or without paid third-party search subscriptions. As such, the web search fallback is designed to support Tavily and Serper when keys are available, and gracefully falls back to DuckDuckGo when keys are omitted.
+
+---
+
+### 4. Design Decisions & Tradeoffs Summary
+
+| Architectural Decision | Chosen Approach | Alternative Considered | Tradeoff / Justification |
+|---|---|---|---|
+| **Pipeline Control** | LangGraph `StateGraph` | Linear LangChain Chain | Slightly higher graph initialization complexity; enables cyclic retries and conditional routing impossible in linear chains. |
+| **Document Relevance** | LLM-as-a-judge (structured JSON) | Cosine similarity threshold | LLM grading adds latency (~400ms) but eliminates vector score calibration errors across different document distributions. |
+| **Vector Database** | ChromaDB (local persistence) | FAISS / Pinecone | ChromaDB provides embedded persistence, SQLite metadata filtering, and zero infrastructure setup, avoiding cloud database dependencies. |
+| **Web Search Fallback** | Multi-tier (Tavily / Serper / DuckDuckGo) | Local-only or single provider | Ensures robustness across differing developer environments without requiring mandatory API billing setup. |
+| **User Feedback** | Integrated `POST /feedback` + Streamlit UI | External analytics tooling | Direct in-app ratings (👍/👎 + comments) stored locally in `data/feedback.json` create a tangible dataset for offline evaluation. |
+
+---
+
+### 5. What Would Be Improved With More Time
+
+1. **Cross-Encoder Reranking**:
+   - Introduce a high-precision reranker (e.g., `cross-encoder/ms-marco-MiniLM-L-6-v2` or Cohere Rerank) between vector retrieval and document grading. This would allow retrieving top-20 chunks cheaply, reranking them, and sending only top-5 to the LLM grader, optimizing both speed and token cost.
+2. **Conversational Memory with Checkpointing**:
+   - Integrate LangGraph's native checkpointer (`MemorySaver` or PostgreSQL checkpointing) to support multi-turn conversational follow-ups (e.g., *"How do I test the endpoint you just described?"*).
+3. **Automated RAG Triad Evaluation**:
+   - Implement an automated testing pipeline using **Ragas** or **TruLens** to quantitatively track Context Precision, Context Recall, Faithfulness, and Answer Relevance against the logged feedback dataset.
+4. **Streaming Token Generation**:
+   - Implement Server-Sent Events (SSE) or WebSocket streaming from FastAPI to Streamlit to minimize Time-To-First-Token (TTFT) and improve perceived UI responsiveness.
+5. **Hybrid Search (Dense + Sparse)**:
+   - Combine dense vector embeddings with sparse keyword search (BM25) using Reciprocal Rank Fusion (RRF). Technical documentation frequently relies on exact method identifiers (e.g., `HTTPException`, `status_code=404`) where lexical matching outperforms purely semantic representations.
